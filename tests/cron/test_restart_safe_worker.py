@@ -71,7 +71,7 @@ def test_genuine_external_worker_crash_is_recovered_unknown(
     assert crashed.returncode == 9
 
     monkeypatch.setattr(execution_ledger, "_PROCESS_ID", "replacement-scheduler")
-    assert execution_ledger.recover_interrupted_executions() == 1
+    assert execution_ledger.recover_interrupted_executions(reason="test") == 1
     recovered = execution_ledger.latest_execution("job-crash")
     assert recovered["status"] == "unknown"
 
@@ -538,7 +538,11 @@ def test_external_worker_crash_recovers_uncertain_attempt(monkeypatch):
 
     with pytest.raises(scheduler._ExternalWorkerPostHandoffError, match="status 9"):
         scheduler._wait_for_external_cron_worker(process, execution_id="exec-1")
-    recover.assert_called_once_with()
+    # The fallback sweep must carry the cause THIS waiter observed, never the blanket
+    # restart wording it cannot substantiate.
+    from cron.scheduler_worker_failure import external_worker_exited_reason
+
+    recover.assert_called_once_with(reason=external_worker_exited_reason(9))
     assert get.call_count == 2
 
 

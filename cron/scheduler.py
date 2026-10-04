@@ -3615,7 +3615,7 @@ def _wait_for_external_cron_worker_body(
 
         reason = external_worker_exited_reason(returncode)
         if not terminalize_dead_owner(execution_id, reason=reason):
-            recover_interrupted_executions()
+            recover_interrupted_executions(reason=reason)
             # A concurrent sweep may have won the unknown transition. Still
             # surface this waiter's exit code and stderr instead of discarding them.
             current = get_execution(execution_id)
@@ -4219,9 +4219,9 @@ def _maybe_reap_dead_owners() -> None:
         return
     _last_dead_owner_reap_at[_reap_key] = _reap_now
     try:
-        from cron.executions import recover_interrupted_executions
+        from cron.executions import _PERIODIC_REAP_REASON, recover_interrupted_executions
 
-        _reclaimed = recover_interrupted_executions()
+        _reclaimed = recover_interrupted_executions(reason=_PERIODIC_REAP_REASON)
         if _reclaimed:
             logger.warning(
                 "Reclaimed %d cron execution(s) whose owner process died "
