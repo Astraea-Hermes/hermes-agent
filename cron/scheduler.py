@@ -3613,7 +3613,26 @@ def _wait_for_external_cron_worker_body(
         # instead: retire the claim and report the uncertain run, not a pre-dispatch failure.
         from cron.scheduler_worker_failure import external_worker_exited_reason
 
-        reason = external_worker_exited_reason(returncode)
+        # The re-read row above is the ONLY evidence of which phase the worker
+        # reached: 'running' means it won the claimed→running adoption gate,
+        # 'claimed' means it died before adopting (an import-time death cannot
+        # have adopted — adoption runs inside the payload path). Stamp the true
+        # phase into the cause; never assert "after adopting" without having seen
+        # the row run.
+        _phase = current.get("status") if current else None
+        adopted: bool | None = _phase == "running" if _phase in ("claimed", "running") else None
+        # Compose the stderr tail BEFORE the ledger write, not only into the raised
+        # message. This is the one branch where the worker's cause of death is in
+        # hand; an import-time death (no durable terminal state, no ack) left the
+        # row with just "exit 9" while the tail lived only in the exception the log
+        # consumed — the operator reading the ledger later saw no evidence at all.
+        # The tail is already bounded and redacted by external_worker_stderr_tail.
+        stderr_tail = ""
+        if stderr_path is not None:
+            from cron.scheduler_diagnostics import external_worker_stderr_tail
+
+            stderr_tail = external_worker_stderr_tail(stderr_path)
+        reason = f"{external_worker_exited_reason(returncode, adopted=adopted)}{stderr_tail}"
         if not terminalize_dead_owner(execution_id, reason=reason):
             recover_interrupted_executions(reason=reason)
             # A concurrent sweep may have won the unknown transition. Still
@@ -3621,12 +3640,7 @@ def _wait_for_external_cron_worker_body(
             current = get_execution(execution_id)
             if current and current.get("status") in ("completed", "failed"):
                 return True
-        stderr_tail = ""
-        if stderr_path is not None:
-            from cron.scheduler_diagnostics import external_worker_stderr_tail
-
-            stderr_tail = external_worker_stderr_tail(stderr_path)
-        raise RuntimeError(f"{reason}{stderr_tail}")
+        raise RuntimeError(reason)
 
 
 class _ExternalWorkerPostHandoffError(RuntimeError):
