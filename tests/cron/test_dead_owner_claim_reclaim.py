@@ -137,7 +137,7 @@ class TestTickReapsDeadOwnerClaims:
         assert len(calls) == 2, "an expired throttle window must reap again"
 
     def test_reap_failure_does_not_break_the_tick(self, monkeypatch):
-        def _boom():
+        def _boom(**_kwargs):
             raise RuntimeError("ledger unavailable")
 
         monkeypatch.setattr(
