@@ -3676,6 +3676,118 @@ def _wait_for_external_cron_worker(
                 pass
 
 
+# Cron worker interpreter resolver.  Some installs start Hermes through a
+# bootstrap shim (``-I`` plus a sys.path insert) with an interpreter binary
+# whose own site-packages carries none of Hermes' dependencies: the parent
+# works because the bootstrap fixed its path, but a child spawned as
+# ``[sys.executable, "-m", "cron.scheduler"]`` does not inherit the shim and
+# dies on its first repo import.  Probe candidate interpreters by BEHAVIOUR,
+# never by name or path — a binary is healthy iff it can actually run the
+# worker's first imports under the child's real launch conditions — and let
+# the operator pin one explicitly with HERMES_CRON_PYTHON.
+#
+# A rejected candidate must never go silent (see _log_rejected_worker_interpreters):
+# an operator-set override that fails its probe and vanishes without a word is
+# indistinguishable from an override that ran, and an instrument that never
+# ran leaves no evidence behind.
+_CRON_WORKER_PYTHON_OK: list[str] = []
+
+
+def _cron_repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _interpreter_is_healthy(candidate: str) -> bool:
+    """Probe under the child's REAL launch conditions: cwd=repo root, stripped
+    env (no PYTHONPATH/PYTHONHOME), importing what the worker imports first."""
+    try:
+        child_env = dict(os.environ)
+        child_env.pop("PYTHONPATH", None)
+        child_env.pop("PYTHONHOME", None)
+        r = subprocess.run(
+            [candidate, "-c", "import cron, ruamel.yaml, httpx"],
+            capture_output=True,
+            timeout=20,
+            cwd=_cron_repo_root(),
+            env=child_env,
+        )
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _log_rejected_worker_interpreters(
+    rejected: list[tuple[str, str, bool]], chosen: Optional[str]
+) -> None:
+    """Say the truth about every candidate the resolver dropped.
+
+    ``rejected`` is ``[(path, reason, was_operator_override), ...]`` in
+    consultation order; ``chosen`` is the interpreter that passed, or ``None``
+    when none did.  The silent-drop case this closes: an earlier candidate
+    passes and the rejected ones — possibly HERMES_CRON_PYTHON, the operator's
+    own pin — are discarded without a word, so an instrument the operator
+    deployed reads as "ran, found nothing" when the truth is "never ran."
+    Silence is not evidence; the drop itself is the event worth logging.
+    """
+    for path, reason, is_override in rejected:
+        if is_override:
+            logger.warning(
+                "cron worker interpreter: operator override HERMES_CRON_PYTHON=%s "
+                "%s — the override is NOT in effect%s",
+                path,
+                reason,
+                f"; worker will run on {chosen}" if chosen else " (no candidate passed)",
+            )
+        else:
+            logger.warning(
+                "cron worker interpreter: candidate %s %s%s",
+                path,
+                reason,
+                f" (chosen: {chosen})" if chosen else "",
+            )
+
+
+def _cron_worker_python() -> str:
+    if _CRON_WORKER_PYTHON_OK:
+        return _CRON_WORKER_PYTHON_OK[0]
+    override = os.environ.get("HERMES_CRON_PYTHON", "").strip()
+    candidates: list[str] = []
+    if override:
+        candidates.append(override)
+    candidates.append(sys.executable)
+    candidates.append(os.path.join(_cron_repo_root(), "venv", "bin", "python"))
+    seen: set[str] = set()
+    rejected: list[tuple[str, str, bool]] = []
+    for cand in candidates:
+        # A duplicate (override naming a later candidate) was consulted under
+        # its own entry — dropping it silently is honest, not an erasure.
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        is_override = cand == override
+        if not os.path.exists(cand):
+            rejected.append((cand, "does not exist", is_override))
+            continue
+        if _interpreter_is_healthy(cand):
+            _CRON_WORKER_PYTHON_OK.append(cand)
+            # A candidate that passed while earlier ones were dropped is the
+            # silent-drop case: the old code returned here without speaking.
+            # The all-failed raise below was always loud; the warning belongs
+            # on the SUCCESS path.  Log before returning so every drop is
+            # named even when resolution succeeds.
+            _log_rejected_worker_interpreters(rejected, chosen=cand)
+            return cand
+        rejected.append((cand, "failed the health probe", is_override))
+    _log_rejected_worker_interpreters(rejected, chosen=None)
+    raise RuntimeError(
+        "cron worker launch refused: no healthy interpreter among ["
+        + ", ".join(f"{path} ({reason})" for path, reason, _ in rejected)
+        + "] (probe: import cron, ruamel.yaml, httpx under cwd=repo root). "
+        "Install is broken; set HERMES_CRON_PYTHON to a Python carrying "
+        "Hermes' dependencies."
+    )
+
+
 def _launch_external_cron_worker(job: dict) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
@@ -3698,8 +3810,9 @@ def _launch_external_cron_worker(job: dict) -> bool:
     ack_path = handoff_dir / f"{execution_id}.ready"
     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
     stderr_path = handoff_dir / f"{execution_id}.stderr"
+    worker_python = _cron_worker_python()
     command = [
-        sys.executable,
+        worker_python,
         "-m",
         "cron.scheduler",
         "--external-worker-file",
